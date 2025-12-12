@@ -1,0 +1,572 @@
+OpenVPN Implementation Guide for PlanetProxy-VPN
+
+  Simple Step-by-Step Documentation
+
+  ---
+  Table of Contents
+
+  1. Overview
+  2. How It Works
+  3. What You Need to Create
+  4. Backend Implementation
+  5. Android App Implementation
+  6. Complete Flow
+  7. Summary
+
+  ---
+  1. Overview
+
+  What We Are Building
+
+  A system where users can connect to VPN using OpenVPN protocol without
+  downloading any config file from server.
+
+  Core Concept
+
+  The app builds the OpenVPN config locally by combining:
+  - Template with certificates (embedded in app)
+  - Username and password (from login API)
+  - Server address (from server list API)
+
+  Key Principle
+
+  No .ovpn file is stored in database or downloaded from server. Everything 
+  is assembled inside the app.
+
+  ---
+  2. How It Works
+
+  Simple Flow Diagram
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │   STEP 1: User Logs In                                      │
+  │   ─────────────────────                                     │
+  │   App calls login API                                       │
+  │   Backend returns: session_token + vpn_username + vpn_pass  │
+  │   App stores credentials locally                            │
+  │                                                             │
+  ├─────────────────────────────────────────────────────────────┤
+  │                                                             │
+  │   STEP 2: App Gets Server List                              │
+  │   ────────────────────────────                              │
+  │   App calls server list API                                 │
+  │   Backend returns: list of servers with IP addresses        │
+  │   App caches server list locally                            │
+  │                                                             │
+  ├─────────────────────────────────────────────────────────────┤
+  │                                                             │
+  │   STEP 3: User Taps Connect                                 │
+  │   ─────────────────────────                                 │
+  │   App loads template from assets (has certificates)         │
+  │   App adds server IP from cached server list                │
+  │   App adds username/password from stored credentials        │
+  │   App writes final config to temp file                      │
+  │   OpenVPN reads file and connects                           │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+  ---
+  3. What You Need to Create
+
+  Backend Side
+
+  | Item                        | Description                          |
+  |-----------------------------|--------------------------------------|
+  | Login API enhancement       | Return vpn_username and vpn_password |
+  | Server list API enhancement | Include OpenVPN server details       |
+
+  Android App Side
+
+  | Item                 | Description                             |
+  |----------------------|-----------------------------------------|
+  | Config template file | Embed in app assets with certificates   |
+  | Credential storage   | Store vpn_username and vpn_password     |
+  | Config builder       | Combine template + server + credentials |
+  | OpenVPN integration  | Library to handle connection            |
+
+  Certificates (One Time Setup)
+
+  | Item           | Description                     |
+  |----------------|---------------------------------|
+  | CA Certificate | Your root certificate authority |
+  | TLS Auth Key   | Static key for extra security   |
+
+  ---
+  4. Backend Implementation
+
+  4.1 Login API Response
+
+  Current Response
+
+  {
+    "success": true,
+    "data": {
+      "accessToken": "jwt_token_here",
+      "user": {
+        "id": 123,
+        "email": "user@example.com"
+      }
+    }
+  }
+
+  New Response (Add VPN Credentials)
+
+  {
+    "success": true,
+    "data": {
+      "accessToken": "jwt_token_here",
+      "user": {
+        "id": 123,
+        "email": "user@example.com"
+      },
+      "vpnCredentials": {
+        "username": "user_123_abc",
+        "password": "pass_xyz_789"
+      }
+    }
+  }
+
+  4.2 How to Generate VPN Credentials
+
+  Simple Method
+
+  Username: "user_" + odId
+  Password: Generate random string or hash(userId + secretKey)
+
+  Example Code (NestJS)
+
+  generateVpnCredentials(userId: number) {
+    const username = `user_${odId}`;
+    const password = crypto
+      .createHash('sha256')
+      .update(`${odId}_${process.env.VPN_SECRET}`)
+      .digest('hex')
+      .substring(0, 16);
+
+    return { username, password };
+  }
+
+  4.3 Server List API Response
+
+  Current Response
+
+  {
+    "servers": [
+      {
+        "serverId": 1,
+        "serverName": "New York",
+        "countryName": "United States",
+        "ipAddress": "185.212.170.140"
+      }
+    ]
+  }
+
+  New Response (Add OpenVPN Details)
+
+  {
+    "servers": [
+      {
+        "serverId": 1,
+        "serverName": "New York",
+        "countryName": "United States",
+        "ipAddress": "185.212.170.140",
+        "protocols": {
+          "wireguard": true,
+          "openvpn": true
+        },
+        "openvpn": {
+          "ipAddresses": ["185.212.170.140", "185.212.170.141"],
+          "udpPort": 1194,
+          "tcpPort": 443
+        }
+      }
+    ]
+  }
+
+  4.4 OpenVPN Server Setup
+
+  Your OpenVPN server needs to validate credentials against your backend.
+
+  Auth Script on OpenVPN Server
+
+  #!/bin/bash
+  # /etc/openvpn/auth.sh
+
+  USERNAME=$1
+  PASSWORD=$2
+
+  # Call your backend API to validate
+  RESULT=$(curl -s -X POST "https://api.planetproxy.com/vpn/validate" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}")
+
+  if echo "$RESULT" | grep -q '"valid":true'; then
+    exit 0  # Success
+  else
+    exit 1  # Fail
+  fi
+
+  Backend Validation Endpoint
+
+  // POST /vpn/validate
+  validateVpnCredentials(username: string, password: string) {
+    // Extract odId from username
+    const odId = username.replace('user_', '');
+
+    // Regenerate expected password
+    const expectedPassword = crypto
+      .createHash('sha256')
+      .update(`${odId}_${process.env.VPN_SECRET}`)
+      .digest('hex')
+      .substring(0, 16);
+
+    return { valid: password === expectedPassword };
+  }
+
+  ---
+  5. Android App Implementation
+
+  5.1 Embed Config Template
+
+  File Location
+
+  app/src/main/assets/openvpn_template.ovpn
+
+  Template Content
+
+  client
+  dev tun
+  proto udp
+  nobind
+  persist-key
+  persist-tun
+  resolv-retry infinite
+  verb 3
+
+  # Server address will be added dynamically
+  # remote <SERVER_IP> <PORT>
+
+  # Authentication
+  auth-user-pass
+
+  # Security settings
+  cipher AES-256-GCM
+  auth SHA256
+  remote-cert-tls server
+  key-direction 1
+
+  # CA Certificate (same for all users)
+  <ca>
+  -----BEGIN CERTIFICATE-----
+  YOUR_CA_CERTIFICATE_HERE
+  -----END CERTIFICATE-----
+  </ca>
+
+  # TLS Auth Key (same for all users)
+  <tls-auth>
+  -----BEGIN OpenVPN Static key V1-----
+  YOUR_TLS_AUTH_KEY_HERE
+  -----END OpenVPN Static key V1-----
+  </tls-auth>
+
+  5.2 Store Credentials After Login
+
+  Data Class
+
+  data class VpnCredentials(
+      val username: String,
+      val password: String
+  )
+
+  Storage Class
+
+  class VpnCredentialStorage(context: Context) {
+
+      private val prefs = EncryptedSharedPreferences.create(
+          "vpn_credentials",
+          MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC),
+          context,
+          EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+          EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+      )
+
+      fun save(credentials: VpnCredentials) {
+          prefs.edit()
+              .putString("vpn_username", credentials.username)
+              .putString("vpn_password", credentials.password)
+              .apply()
+      }
+
+      fun getUsername(): String? = prefs.getString("vpn_username", null)
+
+      fun getPassword(): String? = prefs.getString("vpn_password", null)
+
+      fun clear() {
+          prefs.edit().clear().apply()
+      }
+  }
+
+  5.3 Build Config at Connection Time
+
+  Config Builder Class
+
+  class OpenVpnConfigBuilder(private val context: Context) {
+
+      fun buildConfig(
+          serverIp: String,
+          port: Int,
+          protocol: String,  // "udp" or "tcp"
+          username: String,
+          password: String
+      ): String {
+
+          // Load template from assets
+          val template = context.assets
+              .open("openvpn_template.ovpn")
+              .bufferedReader()
+              .readText()
+
+          // Build remote server line
+          val remoteLine = "remote $serverIp $port $protocol"
+
+          // Insert remote line after "resolv-retry infinite"
+          val config = template.replace(
+              "resolv-retry infinite",
+              "resolv-retry infinite\n$remoteLine"
+          )
+
+          return config
+      }
+
+      fun writeConfigToFile(config: String): File {
+          val file = File(context.cacheDir, "current.ovpn")
+          file.writeText(config)
+          return file
+      }
+
+      fun writeCredentialsToFile(username: String, password: String): File {
+          val file = File(context.cacheDir, "credentials.txt")
+          file.writeText("$username\n$password")
+          return file
+      }
+  }
+
+  5.4 Connection Flow
+
+  ViewModel or Repository
+
+  class VpnConnectionManager(
+      private val context: Context,
+      private val credentialStorage: VpnCredentialStorage,
+      private val configBuilder: OpenVpnConfigBuilder
+  ) {
+
+      fun connectToServer(server: Server) {
+          // Step 1: Get stored credentials
+          val username = credentialStorage.getUsername()
+          val password = credentialStorage.getPassword()
+
+          if (username == null || password == null) {
+              throw Exception("Not logged in")
+          }
+
+          // Step 2: Build config
+          val config = configBuilder.buildConfig(
+              serverIp = server.openvpn.ipAddresses.first(),
+              port = server.openvpn.udpPort,
+              protocol = "udp",
+              username = username,
+              password = password
+          )
+
+          // Step 3: Write to temp files
+          val configFile = configBuilder.writeConfigToFile(config)
+          val credentialsFile =
+  configBuilder.writeCredentialsToFile(username, password)
+
+          // Step 4: Start OpenVPN with config file
+          startOpenVpn(configFile, credentialsFile)
+      }
+
+      private fun startOpenVpn(configFile: File, credentialsFile: File) {
+          // Use OpenVPN library to connect
+          // Implementation depends on which library you use
+      }
+  }
+
+  ---
+  6. Complete Flow
+
+  6.1 One Time Setup (Before First Connection)
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │ GENERATE CERTIFICATES                                       │
+  ├─────────────────────────────────────────────────────────────┤
+  │                                                             │
+  │ 1. Create Certificate Authority (CA)                        │
+  │    - Generate CA private key                                │
+  │    - Generate CA certificate                                │
+  │    - This CA will sign OpenVPN server certificates          │
+  │                                                             │
+  │ 2. Generate TLS Auth Key                                    │
+  │    - Run: openvpn --genkey --secret ta.key                  │
+  │    - This key is shared by all clients and servers          │
+  │                                                             │
+  │ 3. Embed Both in App Template                               │
+  │    - Put CA certificate in <ca> section                     │
+  │    - Put TLS key in <tls-auth> section                      │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+  6.2 User Login Flow
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │ USER LOGS IN                                                │
+  ├─────────────────────────────────────────────────────────────┤
+  │                                                             │
+  │ App                          Backend                        │
+  │  │                              │                           │
+  │  │  POST /auth/login            │                           │
+  │  │  { email, password }         │                           │
+  │  │ ─────────────────────────────>                           │
+  │  │                              │                           │
+  │  │                              │ Validate user             │
+  │  │                              │ Generate JWT token        │
+  │  │                              │ Generate VPN credentials  │
+  │  │                              │                           │
+  │  │  { token, vpnCredentials }   │                           │
+  │  │ <─────────────────────────────                           │
+  │  │                              │                           │
+  │  │ Store token                  │                           │
+  │  │ Store vpnCredentials         │                           │
+  │  │                              │                           │
+  └─────────────────────────────────────────────────────────────┘
+
+  6.3 Connection Flow
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │ USER TAPS CONNECT                                           │
+  ├─────────────────────────────────────────────────────────────┤
+  │                                                             │
+  │ 1. Get Selected Server                                      │
+  │    └── Server: New York, IP: 185.212.170.140               │
+  │                                                             │
+  │ 2. Get Stored Credentials                                   │
+  │    └── Username: user_123, Password: pass_xyz               │
+  │                                                             │
+  │ 3. Load Template from Assets                                │
+  │    └── Template with CA cert and TLS key                    │
+  │                                                             │
+  │ 4. Build Final Config                                       │
+  │    ├── Add: remote 185.212.170.140 1194 udp                │
+  │    ├── Template already has certificates                    │
+  │    └── Credentials go in separate file                      │
+  │                                                             │
+  │ 5. Write Files                                              │
+  │    ├── /cache/current.ovpn (config)                        │
+  │    └── /cache/credentials.txt (username + password)        │
+  │                                                             │
+  │ 6. Start OpenVPN                                            │
+  │    └── OpenVPN reads files and connects                    │
+  │                                                             │
+  │ 7. OpenVPN Authenticates                                    │
+  │    ├── Sends username + password to server                 │
+  │    ├── Server validates against backend API                │
+  │    └── Connection established                              │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+  6.4 What Goes Where
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │   EMBEDDED IN APP (same for all users)                      │
+  │   ────────────────────────────────────                      │
+  │   ┌─────────────────────────────────────────────────────┐   │
+  │   │ • CA Certificate                                    │   │
+  │   │ • TLS Auth Key                                      │   │
+  │   │ • Cipher settings (AES-256-GCM)                    │   │
+  │   │ • Auth settings (SHA256)                           │   │
+  │   │ • Other OpenVPN options                            │   │
+  │   └─────────────────────────────────────────────────────┘   │
+  │                                                             │
+  │   FROM LOGIN API (unique per user)                          │
+  │   ────────────────────────────────                          │
+  │   ┌─────────────────────────────────────────────────────┐   │
+  │   │ • VPN Username                                      │   │
+  │   │ • VPN Password                                      │   │
+  │   └─────────────────────────────────────────────────────┘   │
+  │                                                             │
+  │   FROM SERVER LIST (varies by selection)                    │
+  │   ──────────────────────────────────────                    │
+  │   ┌─────────────────────────────────────────────────────┐   │
+  │   │ • Server IP Address                                 │   │
+  │   │ • Port Number                                       │   │
+  │   │ • Protocol (UDP/TCP)                               │   │
+  │   └─────────────────────────────────────────────────────┘   │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+  ---
+  7. Summary
+
+  What Backend Needs to Do
+
+  | Task                                 | Description
+            |
+  |--------------------------------------|----------------------------------
+  ----------|
+  | Generate VPN credentials             | Create username/password when
+  user logs in |
+  | Return credentials in login response | Add vpnCredentials to login API
+  response   |
+  | Add OpenVPN info to server list      | Include IP addresses and ports
+            |
+  | Create validation endpoint           | For OpenVPN server to verify
+  credentials   |
+
+  What Android App Needs to Do
+
+  | Task                         | Description
+        |
+  |------------------------------|------------------------------------------
+  ------|
+  | Embed config template        | Put template with certificates in assets
+        |
+  | Store credentials            | Save vpn_username and vpn_password after
+  login |
+  | Build config at connect time | Combine template + server + credentials
+        |
+  | Integrate OpenVPN library    | Handle actual VPN connection
+        |
+
+  What Is NOT Needed
+
+  | Not Needed                         | Why
+            |
+  |------------------------------------|------------------------------------
+  ----------|
+  | Store .ovpn files in database      | Config is built in app
+            |
+  | Download config from server        | Config is built in app
+            |
+  | Per-connection API call for config | Only need credentials from login
+            |
+  | Track OpenVPN peers like WireGuard | Credentials are reused, no
+  assignment needed |
+
+  Final One Line Summary
+
+  Embed certificates in app, get credentials at login, get server IP from 
+  server list, build config locally when user connects.
+
+  ---
+  End of Document
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>  
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ? for shortcuts
+
+
